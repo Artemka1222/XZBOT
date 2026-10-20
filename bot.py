@@ -5,12 +5,14 @@ import io
 import json
 import logging
 import os
+import re
 import secrets
+from collections import Counter
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.filters import Command, CommandObject
 from aiogram.types import (
     BufferedInputFile,
@@ -21,24 +23,74 @@ from aiogram.types import (
     Message,
 )
 
-logging.basicConfig(level=logging.INFO)
+# ============================================================
+#  НАСТРОЙКИ
+# ============================================================
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+# file_id анимации для меню (необязательно). Пусто — меню текстом.
+MENU_GIF_ID = os.getenv("MENU_GIF_ID", "").strip()
+# Файл, где хранятся личные наборы пользователей (переживает перезапуск)
+STORE_FILE = os.getenv("STORE_FILE", "store.json").strip()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-if not BOT_TOKEN:
-    raise SystemExit("Задай переменную окружения BOT_TOKEN")
+MAX_TEXT_LEN = 20                # максимальная длина нового текста
+MAX_TGS_BYTES = 64 * 1024        # лимит Telegram на TGS-стикер
+NEEDS_REPAINTING = False         # True — эмодзи перекрасится в цвет текста (градиенты пропадут)
+LIST_LIMIT = 60                  # сколько эмодзи показывать в /list
+PACK_NAME_RE = re.compile(r"^[A-Za-z0-9_]{1,64}$")
 
-# file_id GIF/анимации для меню (необязательно). Если пусто, меню отправляется текстом.
-MENU_GIF_ID = os.getenv("MENU_GIF_ID", "")
+LOTTIE_TEXT_LAYER = 5            # ty = 5 у текстового слоя в Lottie
+LAYER_NAMES = {0: "precomp", 1: "solid", 2: "image", 3: "null", 4: "shape", 5: "text"}
 
-MAX_TEXT_LEN = 20
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+log = logging.getLogger("emoji_bot")
+
 router = Router()
 
-# user_id -> {"pack": str, "stickers": list[Sticker]}
+# user_id (int) -> {"pack": str, "stickers": list[Sticker]}
 loaded: dict[int, dict] = {}
-# user_id -> имя личного набора, созданного ботом
-own_sets: dict[int, str] = {}
+# str(user_id) -> список имён личных наборов (последний — активный)
+own_sets: dict[str, list[str]] = {}
+# один пользователь — одна операция записи в набор за раз
+user_locks: dict[int, asyncio.Lock] = {}
+_bot_username: str | None = None
 
-# ---------- Премиум-эмодзи (ID из emoji.wivvi.net/llms.txt) ----------
+
+def lock_for(user_id: int) -> asyncio.Lock:
+    if user_id not in user_locks:
+        user_locks[user_id] = asyncio.Lock()
+    return user_locks[user_id]
+
+
+# ============================================================
+#  ХРАНИЛИЩЕ
+# ============================================================
+def load_store() -> None:
+    global own_sets
+    try:
+        with open(STORE_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        own_sets = {str(k): list(v) for k, v in data.get("own_sets", {}).items()}
+        log.info("Загружено личных наборов: %d", len(own_sets))
+    except FileNotFoundError:
+        own_sets = {}
+    except (json.JSONDecodeError, AttributeError, TypeError, ValueError) as e:
+        log.warning("Не смог прочитать %s (%s), начинаю с пустого", STORE_FILE, e)
+        own_sets = {}
+
+
+def save_store() -> None:
+    tmp = STORE_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"own_sets": own_sets}, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, STORE_FILE)
+
+
+# ============================================================
+#  ПРЕМИУМ-ЭМОДЗИ (ID только из emoji.wivvi.net/llms.txt)
+# ============================================================
 E_COMMANDS = "5962952497197748583"  # 🔧 Команды /
 E_FOLDER = "6039630677182254664"    # 📂 Папка
 E_LIST = "5766994197705921104"      # 🗂 Список
@@ -50,11 +102,15 @@ E_INFO = "6028435952299413210"      # ℹ Инфо
 E_OK = "5774022692642492953"        # ✅ Галочка
 E_ERR = "5774077015388852135"       # ❌ Крестик
 E_WARN = "6030563507299160824"      # ❗️ Внимание
+E_DEBUG = "5904219717073114606"     # 📁 Просмотр файла
 
 
-def pe(emoji_id: str, fallback: str) -> str:
-    """Премиум-эмодзи для текста. fallback — обычный эмодзи из списка."""
-    return f'<tg-emoji emoji-id="{emoji_id}">{fallback}</tg-emoji>'
+def pe(emoji_id: str | None, fallback: str) -> str:
+    """Премиум-эмодзи для HTML-текста. Без ID — обычный эмодзи."""
+    fb = html.escape(fallback)
+    if not emoji_id:
+        return fb
+    return f'<tg-emoji emoji-id="{emoji_id}">{fb}</tg-emoji>'
 
 
 def ok(text: str) -> str:
@@ -69,8 +125,8 @@ def warn(text: str) -> str:
     return f"{pe(E_WARN, '❗️')} {text}"
 
 
-def btn(text: str, emoji_id: str, callback_data: str | None = None, url: str | None = None):
-    """Кнопка с премиум-иконкой. Текст без обычного эмодзи."""
+def btn(text: str, emoji_id: str, callback_data: str | None = None, url: str | None = None) -> InlineKeyboardButton:
+    """Кнопка с премиум-иконкой. В тексте кнопки обычных эмодзи нет."""
     return InlineKeyboardButton(
         text=text,
         icon_custom_emoji_id=emoji_id,
@@ -87,7 +143,8 @@ HELP_TEXT = (
     f"{pe(E_GIFT, '🎁')} /myset — мой личный набор\n"
     f"{pe(E_TRASH, '🗑')} /delete &lt;номер&gt; — удалить из моего набора\n"
     f"{pe(E_CODE, '🔨')} /ids — ответом на сообщение с эмодзи\n"
-    f"{pe(E_INFO, 'ℹ')} /info &lt;пак&gt; — информация о паке"
+    f"{pe(E_INFO, 'ℹ')} /info &lt;пак&gt; — информация о паке\n"
+    f"{pe(E_DEBUG, '📁')} /debug &lt;номер&gt; — типы слоёв эмодзи"
 )
 
 
@@ -102,45 +159,42 @@ def main_menu() -> InlineKeyboardMarkup:
     ])
 
 
-async def send_menu(target: Message, text: str, markup: InlineKeyboardMarkup):
+def open_set_markup(name: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [btn("Открыть набор", E_FOLDER, url=f"https://t.me/addemoji/{name}")]
+    ])
+
+
+async def send_menu(target: Message, text: str, markup: InlineKeyboardMarkup) -> None:
     """Меню с GIF, если задан MENU_GIF_ID, иначе обычным текстом."""
     if MENU_GIF_ID:
-        return await target.answer_animation(MENU_GIF_ID, caption=text, reply_markup=markup)
-    return await target.answer(text, reply_markup=markup)
+        try:
+            await target.answer_animation(MENU_GIF_ID, caption=text, reply_markup=markup)
+            return
+        except TelegramAPIError as e:
+            log.warning("GIF меню не отправился (%s), шлю текстом", e)
+    await target.answer(text, reply_markup=markup)
+
+
+# ============================================================
+#  РАБОТА С ПАКАМИ И ФАЙЛАМИ
+# ============================================================
+class EmojiError(Exception):
+    """Понятная пользователю ошибка (текст уйдёт в ответ как есть)."""
 
 
 def pack_name_from(arg: str) -> str:
-    """Принимает 'EmojiStriver' или 'https://t.me/addemoji/EmojiStriver'."""
-    return arg.strip().rstrip("/").split("/")[-1]
+    """'EmojiStriver' или 'https://t.me/addemoji/EmojiStriver?x=1' -> 'EmojiStriver'."""
+    cleaned = arg.strip().split("?")[0].rstrip("/")
+    return cleaned.split("/")[-1]
 
 
-def replace_text_in_node(node, text: str) -> int:
-    """Рекурсивно находит текстовые слои Lottie (ty == 5) и меняет строку текста."""
-    count = 0
-    if isinstance(node, dict):
-        if node.get("ty") == 5 and isinstance(node.get("t"), dict):
-            count += _set_text_docs(node["t"], text)
-        for value in node.values():
-            if isinstance(value, (dict, list)):
-                count += replace_text_in_node(value, text)
-    elif isinstance(node, list):
-        for item in node:
-            count += replace_text_in_node(item, text)
-    return count
-
-
-def _set_text_docs(t_obj: dict, text: str) -> int:
-    d = t_obj.get("d")
-    if not isinstance(d, dict):
-        return 0
-    k = d.get("k")
-    frames = k if isinstance(k, list) else [k]
-    n = 0
-    for frame in frames:
-        if isinstance(frame, dict) and isinstance(frame.get("s"), dict) and "t" in frame["s"]:
-            frame["s"]["t"] = text
-            n += 1
-    return n
+async def bot_username(bot: Bot) -> str:
+    global _bot_username
+    if _bot_username is None:
+        me = await bot.get_me()
+        _bot_username = me.username or ""
+    return _bot_username
 
 
 async def download_bytes(bot: Bot, sticker) -> bytes:
@@ -149,33 +203,169 @@ async def download_bytes(bot: Bot, sticker) -> bytes:
     return buf.getvalue()
 
 
-async def show_list(target: Message, user_id: int):
+def _set_text(doc, text: str) -> int:
+    """Меняет строку в объекте TextDocument. Возвращает 1, если заменено."""
+    if isinstance(doc, dict) and isinstance(doc.get("t"), str):
+        doc["t"] = text
+        return 1
+    return 0
+
+
+def replace_text_in_lottie(node, text: str) -> int:
+    """
+    Рекурсивно обходит Lottie и меняет текст во всех текстовых слоях (ty == 5).
+
+    В Lottie текст лежит в layer["t"]["d"]["k"]. Бывает два варианта:
+      - статичный текст: k — это сам TextDocument с полем "t";
+      - ключевые кадры: k — список, а в каждом кадре TextDocument лежит в "s".
+    Старый код смотрел только на второй вариант, поэтому статичный текст не находил.
+    """
+    count = 0
+    if isinstance(node, dict):
+        if node.get("ty") == LOTTIE_TEXT_LAYER and isinstance(node.get("t"), dict):
+            d = node["t"].get("d")
+            k = d.get("k") if isinstance(d, dict) else None
+            if isinstance(k, dict):
+                count += _set_text(k, text)
+            elif isinstance(k, list):
+                for kf in k:
+                    if not isinstance(kf, dict):
+                        continue
+                    s = kf.get("s")
+                    if isinstance(s, dict):
+                        count += _set_text(s, text)
+                    elif isinstance(s, list):
+                        for doc in s:
+                            count += _set_text(doc, text)
+        for value in node.values():
+            if isinstance(value, (dict, list)):
+                count += replace_text_in_lottie(value, text)
+    elif isinstance(node, list):
+        for item in node:
+            count += replace_text_in_lottie(item, text)
+    return count
+
+
+def collect_layer_types(node, counter: Counter) -> None:
+    """Считает слои по типу (для диагностики через /debug)."""
+    if isinstance(node, dict):
+        ty = node.get("ty")
+        if isinstance(ty, int) and "ind" in node:
+            counter[ty] += 1
+        for value in node.values():
+            if isinstance(value, (dict, list)):
+                collect_layer_types(value, counter)
+    elif isinstance(node, list):
+        for item in node:
+            collect_layer_types(item, counter)
+
+
+def decode_tgs(raw: bytes) -> dict:
+    try:
+        return json.loads(gzip.decompress(raw))
+    except (OSError, EOFError, ValueError) as e:
+        raise EmojiError(f"Не смог прочитать TGS-файл эмодзи ({e.__class__.__name__})")
+
+
+def make_text_tgs(raw: bytes, text: str) -> bytes:
+    """Из TGS-байтов делает новый TGS с другим текстом. Бросает EmojiError при проблеме."""
+    obj = decode_tgs(raw)
+    changed = replace_text_in_lottie(obj, text)
+    if changed == 0:
+        raise EmojiError(
+            "В этом эмодзи нет текстовых слоёв, поэтому текст поменять нельзя. "
+            "Смотри /debug, там видно, какие слои внутри"
+        )
+    out = gzip.compress(
+        json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    )
+    if len(out) > MAX_TGS_BYTES:
+        raise EmojiError(
+            f"Получился TGS {len(out) // 1024} КБ, а лимит Telegram 64 КБ. Возьми текст короче"
+        )
+    return out
+
+
+async def add_to_own_set(bot: Bot, user_id: int, tgs: bytes, emoji: str) -> str:
+    """
+    Добавляет эмодзи в личный набор пользователя.
+    Если активный набор заполнен или недоступен — создаёт новый.
+    Возвращает имя набора, куда попало эмодзи.
+    """
+
+    def make_sticker() -> InputSticker:
+        return InputSticker(
+            sticker=BufferedInputFile(tgs, filename="emoji.tgs"),
+            format="animated",
+            emoji_list=[emoji],
+        )
+
+    key = str(user_id)
+    sets = own_sets.setdefault(key, [])
+
+    if sets:
+        name = sets[-1]
+        try:
+            await bot.add_sticker_to_set(user_id=user_id, name=name, sticker=make_sticker())
+            return name
+        except TelegramBadRequest as e:
+            log.info("Не смог добавить в %s (%s), создаю новый набор", name, e)
+
+    username = await bot_username(bot)
+    name = f"t{user_id}_{secrets.token_hex(3)}_by_{username}"
+    await bot.create_new_sticker_set(
+        user_id=user_id,
+        name=name,
+        title="My text emoji",
+        stickers=[make_sticker()],
+        sticker_type="custom_emoji",
+        needs_repainting=NEEDS_REPAINTING,
+    )
+    sets.append(name)
+    save_store()
+    return name
+
+
+async def last_custom_id(bot: Bot, name: str) -> str | None:
+    s = await bot.get_sticker_set(name)
+    return s.stickers[-1].custom_emoji_id if s.stickers else None
+
+
+async def show_list(target: Message, user_id: int) -> None:
     data = loaded.get(user_id)
     if not data:
         return await target.answer(err("Сначала загрузи пак: /load EmojiStriver"))
-    rows = []
-    for i, st in enumerate(data["stickers"][:60]):
-        rows.append(f"{i}. {pe(st.custom_emoji_id, st.emoji or '•')}")
-    extra = len(data["stickers"]) - 60
+    rows = [
+        f"{i}. {pe(st.custom_emoji_id, st.emoji or '•')}"
+        for i, st in enumerate(data["stickers"][:LIST_LIMIT])
+    ]
     text = f"{pe(E_LIST, '🗂')} <b>Эмодзи пака</b>\n" + "\n".join(rows)
+    extra = len(data["stickers"]) - LIST_LIMIT
     if extra > 0:
         text += f"\n… и ещё {extra}"
     await target.answer(text)
 
 
-async def show_myset(target: Message, user_id: int, bot: Bot):
-    name = own_sets.get(user_id)
-    if not name:
+async def show_myset(target: Message, user_id: int, bot: Bot) -> None:
+    sets = own_sets.get(str(user_id))
+    if not sets:
         return await target.answer(warn("Личного набора пока нет, сначала сделай /replace"))
-    s = await bot.get_sticker_set(name)
+    name = sets[-1]
+    try:
+        s = await bot.get_sticker_set(name)
+    except TelegramAPIError as e:
+        return await target.answer(err(f"Не смог открыть набор: {html.escape(str(e))}"))
     await target.answer(
-        f"{pe(E_GIFT, '🎁')} <b>Мой набор</b>\nЭмодзи: {len(s.stickers)}",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [btn("Открыть набор", E_FOLDER, url=f"https://t.me/addemoji/{name}")]
-        ]),
+        f"{pe(E_GIFT, '🎁')} <b>Мой набор</b>\n"
+        f"Эмодзи в наборе: {len(s.stickers)}\n"
+        f"Наборов всего: {len(sets)}",
+        reply_markup=open_set_markup(name),
     )
 
 
+# ============================================================
+#  ХЭНДЛЕРЫ
+# ============================================================
 @router.message(Command("start", "help"))
 async def cmd_start(message: Message):
     await send_menu(message, HELP_TEXT, main_menu())
@@ -183,13 +373,13 @@ async def cmd_start(message: Message):
 
 @router.callback_query(F.data.startswith("menu:"))
 async def on_menu(callback: CallbackQuery, bot: Bot):
-    action = callback.data.split(":", 1)[1]
-    await callback.answer()  # всплывающий текст без премиум-эмодзи
+    action = (callback.data or "").split(":", 1)[1]
+    await callback.answer()  # всплывающие ответы — без премиум-эмодзи, по гайду
     msg = callback.message
-    if msg is None:
+    if not isinstance(msg, Message):
         return
     if action == "load":
-        await msg.answer(f"{pe(E_FOLDER, '📂')} Отправь команду: /load EmojiStriver")
+        await msg.answer(f"{pe(E_FOLDER, '📂')} Отправь: /load EmojiStriver")
     elif action == "list":
         await show_list(msg, callback.from_user.id)
     elif action == "myset":
@@ -200,15 +390,23 @@ async def on_menu(callback: CallbackQuery, bot: Bot):
 
 @router.message(Command("load"))
 async def cmd_load(message: Message, command: CommandObject, bot: Bot):
+    user_id = message.from_user.id
     if not command.args:
-        return await message.answer(err("Использование: /load EmojiStriver"))
+        return await message.answer(warn("Использование: /load EmojiStriver"))
+
     name = pack_name_from(command.args)
+    if not PACK_NAME_RE.match(name):
+        return await message.answer(err("Некорректное имя пака"))
+
     try:
         pack = await bot.get_sticker_set(name)
-    except TelegramBadRequest as e:
+    except TelegramAPIError as e:
         return await message.answer(err(f"Не удалось загрузить пак: {html.escape(str(e))}"))
 
-    loaded[message.from_user.id] = {"pack": name, "stickers": pack.stickers}
+    if pack.sticker_type != "custom_emoji":
+        return await message.answer(warn("Это не пак премиум-эмодзи, нужна ссылка вида t.me/addemoji/..."))
+
+    loaded[user_id] = {"pack": name, "stickers": pack.stickers}
     await message.answer(
         ok(f"Пак <b>{html.escape(pack.title)}</b> загружен, эмодзи: {len(pack.stickers)}.\n"
            "Смотри номера через /list")
@@ -230,59 +428,41 @@ async def cmd_replace(message: Message, command: CommandObject, bot: Bot):
     parts = (command.args or "").split(maxsplit=1)
     if len(parts) != 2 or not parts[0].isdigit():
         return await message.answer(warn("Использование: /replace 3 Привет"))
-    idx, new_text = int(parts[0]), parts[1].strip()
 
+    idx = int(parts[0])
+    new_text = parts[1].strip()
+    if not new_text:
+        return await message.answer(warn("Текст не может быть пустым"))
     if len(new_text) > MAX_TEXT_LEN:
         return await message.answer(warn(f"Текст длиннее {MAX_TEXT_LEN} символов"))
     if idx >= len(data["stickers"]):
-        return await message.answer(err("Нет эмодзи с таким номером"))
+        return await message.answer(err("Нет эмодзи с таким номером, смотри /list"))
 
     src = data["stickers"][idx]
-    if not src.is_animated:
-        return await message.answer(err("Этот эмодзи не анимированный, текст через TGS не поменять"))
+    if src.is_video or not src.is_animated:
+        return await message.answer(err("Текст можно менять только в анимированных TGS-эмодзи"))
 
-    raw = await download_bytes(bot, src)
     try:
-        obj = json.loads(gzip.decompress(raw))
-    except (OSError, json.JSONDecodeError):
-        return await message.answer(err("Не смог прочитать TGS-файл эмодзи"))
+        raw = await download_bytes(bot, src)
+        tgs = make_text_tgs(raw, new_text)
+        async with lock_for(user_id):
+            name = await add_to_own_set(bot, user_id, tgs, src.emoji or "✨")
+        custom_id = await last_custom_id(bot, name)
+    except EmojiError as e:
+        return await message.answer(err(html.escape(str(e))))
+    except TelegramAPIError as e:
+        log.warning("Telegram отклонил /replace: %s", e)
+        return await message.answer(err(f"Telegram отклонил эмодзи: {html.escape(str(e))}"))
+    except Exception:
+        log.exception("Непредвиденная ошибка в /replace")
+        return await message.answer(err("Внутренняя ошибка, попробуй ещё раз"))
 
-    changed = replace_text_in_node(obj, new_text)
-    if changed == 0:
-        return await message.answer(err("В этом эмодзи не нашёл текстовых слоёв"))
+    if custom_id is None:
+        return await message.answer(err("Эмодзи добавлен, но не удалось получить его ID"))
 
-    new_tgs = gzip.compress(json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode())
-    sticker = InputSticker(
-        sticker=BufferedInputFile(new_tgs, filename="emoji.tgs"),
-        format="animated",
-        emoji_list=[src.emoji or "✨"],
-    )
-
-    me = await bot.get_me()
-    name = own_sets.get(user_id)
-    try:
-        if name is None:
-            name = f"t{user_id}_{secrets.token_hex(3)}_by_{me.username}"
-            await bot.create_new_sticker_set(
-                user_id=user_id,
-                name=name,
-                title="My text emoji",
-                stickers=[sticker],
-                sticker_type="custom_emoji",
-            )
-            own_sets[user_id] = name
-        else:
-            await bot.add_sticker_to_set(user_id=user_id, name=name, sticker=sticker)
-    except TelegramBadRequest as e:
-        return await message.answer(err(f"Telegram отклонил набор: {html.escape(str(e))}"))
-
-    created = await bot.get_sticker_set(name)
-    custom_id = created.stickers[-1].custom_emoji_id
     await message.answer(
         ok(f"Готово: {pe(custom_id, src.emoji or '✨')}"),
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [btn("Открыть набор", E_FOLDER, url=f"https://t.me/addemoji/{name}")]
-        ]),
+        reply_markup=open_set_markup(name),
     )
 
 
@@ -293,16 +473,29 @@ async def cmd_myset(message: Message, bot: Bot):
 
 @router.message(Command("delete"))
 async def cmd_delete(message: Message, command: CommandObject, bot: Bot):
-    name = own_sets.get(message.from_user.id)
-    if not name:
+    user_id = message.from_user.id
+    sets = own_sets.get(str(user_id))
+    if not sets:
         return await message.answer(warn("Личного набора пока нет"))
-    if not command.args or not command.args.strip().isdigit():
+
+    arg = (command.args or "").strip()
+    if not arg.isdigit():
         return await message.answer(warn("Использование: /delete 0"))
-    s = await bot.get_sticker_set(name)
-    idx = int(command.args.strip())
+
+    try:
+        s = await bot.get_sticker_set(sets[-1])
+    except TelegramAPIError as e:
+        return await message.answer(err(f"Не смог открыть набор: {html.escape(str(e))}"))
+
+    idx = int(arg)
     if idx >= len(s.stickers):
         return await message.answer(err("Нет эмодзи с таким номером"))
-    await bot.delete_sticker_from_set(s.stickers[idx].file_id)
+
+    try:
+        async with lock_for(user_id):
+            await bot.delete_sticker_from_set(s.stickers[idx].file_id)
+    except TelegramAPIError as e:
+        return await message.answer(err(f"Не смог удалить: {html.escape(str(e))}"))
     await message.answer(ok("Удалил"))
 
 
@@ -312,32 +505,83 @@ async def cmd_ids(message: Message):
     if not target:
         return await message.answer(warn("Ответь командой /ids на сообщение с эмодзи"))
     entities = (target.entities or []) + (target.caption_entities or [])
-    ids = [e.custom_emoji_id for e in entities if e.type == "custom_emoji"]
+    ids = [e.custom_emoji_id for e in entities if e.type == "custom_emoji" and e.custom_emoji_id]
     if not ids:
         return await message.answer(err("В сообщении нет премиум-эмодзи"))
-    await message.answer(f"{pe(E_CODE, '🔨')} <b>custom_emoji_id:</b>\n" + "\n".join(ids))
+    await message.answer(
+        f"{pe(E_CODE, '🔨')} <b>custom_emoji_id:</b>\n" + "\n".join(f"<code>{i}</code>" for i in ids)
+    )
 
 
 @router.message(Command("info"))
 async def cmd_info(message: Message, command: CommandObject, bot: Bot):
     if not command.args:
         return await message.answer(warn("Использование: /info EmojiStriver"))
+    name = pack_name_from(command.args)
+    if not PACK_NAME_RE.match(name):
+        return await message.answer(err("Некорректное имя пака"))
     try:
-        s = await bot.get_sticker_set(pack_name_from(command.args))
-    except TelegramBadRequest as e:
+        s = await bot.get_sticker_set(name)
+    except TelegramAPIError as e:
         return await message.answer(err(f"Не нашёл пак: {html.escape(str(e))}"))
     await message.answer(
         f"{pe(E_INFO, 'ℹ')} <b>{html.escape(s.title)}</b>\n"
-        f"Тип: {s.sticker_type}\n"
+        f"Тип: {html.escape(str(s.sticker_type))}\n"
         f"Эмодзи: {len(s.stickers)}"
     )
 
 
-async def main():
+@router.message(Command("debug"))
+async def cmd_debug(message: Message, command: CommandObject, bot: Bot):
+    """Показывает, какие слои внутри эмодзи — чтобы понять, почему нет текста."""
+    data = loaded.get(message.from_user.id)
+    if not data:
+        return await message.answer(err("Сначала загрузи пак: /load EmojiStriver"))
+    arg = (command.args or "").strip()
+    if not arg.isdigit() or int(arg) >= len(data["stickers"]):
+        return await message.answer(warn("Использование: /debug 3 (номер из /list)"))
+
+    src = data["stickers"][int(arg)]
+    if src.is_video or not src.is_animated:
+        return await message.answer(err("Это не TGS-анимация"))
+    try:
+        raw = await download_bytes(bot, src)
+        obj = decode_tgs(raw)
+    except EmojiError as e:
+        return await message.answer(err(html.escape(str(e))))
+    except TelegramAPIError as e:
+        return await message.answer(err(f"Не смог скачать эмодзи: {html.escape(str(e))}"))
+
+    counter: Counter = Counter()
+    collect_layer_types(obj, counter)
+    if not counter:
+        return await message.answer(err("Слоёв не нашёл, файл пустой или нестандартный"))
+    lines = [
+        f"• {LAYER_NAMES.get(ty, 'ty=' + str(ty))} (ty={ty}): {n}"
+        for ty, n in sorted(counter.items())
+    ]
+    await message.answer(
+        f"{pe(E_DEBUG, '📁')} <b>Слои эмодзи {arg}</b>\n" + "\n".join(lines)
+    )
+
+
+# ============================================================
+#  ЗАПУСК
+# ============================================================
+async def main() -> None:
+    global _bot_username
+    if not BOT_TOKEN:
+        raise SystemExit("Задай переменную окружения BOT_TOKEN")
+
+    load_store()
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    me = await bot.get_me()
+    _bot_username = me.username or ""
+    log.info("Бот запущен: @%s", _bot_username)
+
     dp = Dispatcher()
     dp.include_router(router)
-    await dp.start_polling(bot)
+    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
 
 if __name__ == "__main__":
